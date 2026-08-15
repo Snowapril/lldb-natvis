@@ -35,11 +35,38 @@ command script import /path/to/lldb-natvis/lldb_natvis.py
 natvis load /path/to/YourProject.natvis
 ```
 
+### Per-project setup in Xcode (scheme "LLDB Init File")
+
+To scope the setup to one project — and share it with teammates through the
+scheme — use a project-local lldbinit instead of the global one:
+
+1. Create `debug.lldbinit` at your project root:
+
+   ```
+   command script import /path/to/lldb-natvis/lldb_natvis.py
+   natvis load /path/to/YourProject
+   ```
+
+   `natvis load` on a directory scans it recursively, so pointing it at the
+   project root picks up every `.natvis` in the tree.
+
+2. In Xcode: **Product → Scheme → Edit Scheme → Run → Options → LLDB Init
+   File**, and set it to the file — build variables work, e.g.
+   `$(SRCROOT)/debug.lldbinit`.
+
+3. Debug as usual: the Variables view and console are natvis-formatted from
+   the first breakpoint. Mark the scheme as *Shared* (Manage Schemes) to check
+   it into the repo for the whole team.
+
+> When a scheme sets an LLDB Init File, lldb reads **that file instead of**
+> `~/.lldbinit`, which is why step 1 includes the `command script import` line
+> (and any other global lldbinit settings you rely on).
+
 ## The `natvis` command
 
 | Command | Effect |
 |---|---|
-| `natvis load <file-or-dir>` | load a `.natvis` file, or all `*.natvis` in a directory |
+| `natvis load <file-or-dir>` | load a `.natvis` file, or every `*.natvis` under a directory (recursive) |
 | `natvis reload` | re-parse and re-register everything (picks up file edits) |
 | `natvis list [-v]` | loaded files, type counts, parse warnings |
 | `natvis unload [<file>\|--all]` | remove visualizers |
