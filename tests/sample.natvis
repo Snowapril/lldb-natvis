@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <!-- wildcard + $T1 + ArrayItems -->
+  <Type Name="MyVector&lt;*&gt;">
+    <DisplayString>{{ size={mSize} }}</DisplayString>
+    <Expand>
+      <Item Name="[size]">mSize</Item>
+      <Item Name="[capacity]">mCapacity</Item>
+      <ArrayItems>
+        <Size>mSize</Size>
+        <ValuePointer>mData</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
+  <!-- fixed array + {arr,[n]} + multi-dim ArrayItems inside Synthetic -->
+  <Type Name="FixedArr">
+    <DisplayString>arr({count}) = {data,[count]}</DisplayString>
+    <Expand>
+      <ArrayItems>
+        <Size>count</Size>
+        <ValuePointer>data</ValuePointer>
+      </ArrayItems>
+      <Synthetic Name="[grid]">
+        <DisplayString>3x4 grid</DisplayString>
+        <Expand>
+          <ArrayItems>
+            <Direction>Forward</Direction>
+            <Rank>2</Rank>
+            <Size>$i == 0 ? 3 : 4</Size>
+            <ValuePointer>&amp;grid[0][0]</ValuePointer>
+          </ArrayItems>
+        </Expand>
+      </Synthetic>
+    </Expand>
+  </Type>
+
+  <!-- LinkedListItems -->
+  <Type Name="MyList">
+    <DisplayString>{{ count={count} }}</DisplayString>
+    <Expand>
+      <LinkedListItems>
+        <Size>count</Size>
+        <HeadPointer>head</HeadPointer>
+        <NextPointer>next</NextPointer>
+        <ValueNode>val</ValueNode>
+      </LinkedListItems>
+    </Expand>
+  </Type>
+
+  <!-- TreeItems, two-wildcard binding -->
+  <Type Name="MyMap&lt;*,*&gt;">
+    <DisplayString>{{ size={size} }}</DisplayString>
+    <Expand>
+      <TreeItems>
+        <Size>size</Size>
+        <HeadPointer>root</HeadPointer>
+        <LeftPointer>left</LeftPointer>
+        <RightPointer>right</RightPointer>
+        <ValueNode>value</ValueNode>
+      </TreeItems>
+    </Expand>
+  </Type>
+
+  <!-- strings + StringView -->
+  <Type Name="MyString">
+    <DisplayString>{data,s} (len={len})</DisplayString>
+    <StringView>data,sb</StringView>
+    <Expand>
+      <Item Name="[len]">len</Item>
+    </Expand>
+  </Type>
+  <Type Name="MyU16String">
+    <DisplayString>{data,su}</DisplayString>
+    <StringView>data,sub</StringView>
+  </Type>
+
+  <!-- ,en + flags + ,x ,d -->
+  <Type Name="ColorHolder">
+    <DisplayString>c={c,en} f={f,en} raw={f,x}</DisplayString>
+  </Type>
+
+  <!-- Intrinsic with Parameter -->
+  <Type Name="Temperature">
+    <Intrinsic Name="toF" Expression="c * 9 / 5 + 32">
+      <Parameter Name="c" Type="float"/>
+    </Intrinsic>
+    <DisplayString>{celsius}C = {toF(celsius)}F</DisplayString>
+  </Type>
+
+  <!-- inheritance -->
+  <Type Name="Shape">
+    <DisplayString>Shape #{id}</DisplayString>
+  </Type>
+  <Type Name="Circle">
+    <DisplayString>circle r={radius}</DisplayString>
+    <Expand>
+      <Item Name="[radius]">radius</Item>
+      <ExpandedItem>*(Shape*)this</ExpandedItem>
+    </Expand>
+  </Type>
+
+  <!-- ExpandedItem this-splice -->
+  <Type Name="SelfExpand">
+    <DisplayString>sum={x + y}</DisplayString>
+    <Expand>
+      <Item Name="[sum]">x + y</Item>
+      <ExpandedItem>this</ExpandedItem>
+    </Expand>
+  </Type>
+
+  <!-- Optional + alternative ordering: first matching Condition wins -->
+  <Type Name="OptHolder">
+    <DisplayString Condition="mode == 0">zero:{a}</DisplayString>
+    <DisplayString Optional="true">{missing_member}</DisplayString>
+    <DisplayString>other:{a}</DisplayString>
+  </Type>
+
+  <!-- Synthetic with computed DisplayString -->
+  <Type Name="Vec3">
+    <DisplayString>({x}, {y}, {z})</DisplayString>
+    <Expand>
+      <Item Name="x">x</Item>
+      <Item Name="y">y</Item>
+      <Item Name="z">z</Item>
+      <Synthetic Name="[len2]">
+        <DisplayString>{x*x + y*y + z*z}</DisplayString>
+      </Synthetic>
+    </Expand>
+  </Type>
+
+  <!-- IndexListItems with $i -->
+  <Type Name="Deque">
+    <DisplayString>{{ len={len} }}</DisplayString>
+    <Expand>
+      <IndexListItems>
+        <Size>len</Size>
+        <ValueNode>ring[($i + start) % 8]</ValueNode>
+      </IndexListItems>
+    </Expand>
+  </Type>
+
+  <!-- CustomListItems: Variable/Size/Loop/If/Exec/Break/Item -->
+  <Type Name="MyHashTable">
+    <DisplayString>{{ count={count} }}</DisplayString>
+    <Expand>
+      <CustomListItems MaxItemsPerView="100">
+        <Variable Name="i" InitialValue="0"/>
+        <Variable Name="pB" InitialValue="buckets[0]"/>
+        <Size>count</Size>
+        <Loop>
+          <Break Condition="i &gt;= 8"/>
+          <Exec>pB = buckets[i]</Exec>
+          <Loop Condition="pB != 0">
+            <If Condition="pB-&gt;value != 0">
+              <Item Name="[{pB-&gt;key}]">pB-&gt;value</Item>
+            </If>
+            <Exec>pB = pB-&gt;next</Exec>
+          </Loop>
+          <Exec>i = i + 1</Exec>
+        </Loop>
+      </CustomListItems>
+    </Expand>
+  </Type>
+
+  <!-- Priority: High entry must win over the earlier Low one -->
+  <Type Name="Both" Priority="Low">
+    <DisplayString>low:{v}</DisplayString>
+  </Type>
+  <Type Name="Both" Priority="High">
+    <DisplayString>high:{v}</DisplayString>
+  </Type>
+
+  <!-- AlternativeType -->
+  <Type Name="PrimaryThatDoesNotExist">
+    <AlternativeType Name="AliasVector"/>
+    <DisplayString>alias v={v}</DisplayString>
+  </Type>
+
+  <!-- regression: negative Size -> zero children, no fabricated elements -->
+  <Type Name="BadSize">
+    <DisplayString>bad n={n}</DisplayString>
+    <Expand>
+      <ArrayItems>
+        <Size>n</Size>
+        <ValuePointer>p</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
+  <!-- regression: recursive Intrinsic is bounded; Optional falls through -->
+  <Type Name="RecIntr">
+    <Intrinsic Name="f" Expression="f(x) + 1">
+      <Parameter Name="x" Type="int"/>
+    </Intrinsic>
+    <DisplayString Optional="true">{f(v)}</DisplayString>
+    <DisplayString>rec-safe:{v}</DisplayString>
+  </Type>
+
+  <!-- views -->
+  <Type Name="Viewy">
+    <DisplayString ExcludeView="simple">full:{a} {b}</DisplayString>
+    <DisplayString>brief:{a}</DisplayString>
+  </Type>
+  <Type Name="ViewHolder">
+    <DisplayString>[{vw,view(simple)}] [{vw}]</DisplayString>
+  </Type>
+
+</AutoVisualizer>

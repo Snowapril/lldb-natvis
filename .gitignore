@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+tests/test_bin
+tests/test_bin.dSYM/
+.claude/
+.DS_Store
