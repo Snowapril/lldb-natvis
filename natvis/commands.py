@@ -9,7 +9,7 @@ from .registry import REGISTRY
 
 _HELP = """natvis %s - Visual Studio .natvis formatters for LLDB
 Subcommands:
-  natvis load <file-or-dir>   load a .natvis file (or all *.natvis in a dir)
+  natvis load <file-or-dir>   load a .natvis file (dirs scanned recursively)
   natvis reload               re-parse and re-register all loaded files
   natvis list [-v]            show loaded files and their types
   natvis unload [<file>|--all]
@@ -56,12 +56,17 @@ class NatvisCommand:
             return
         REGISTRY.attach(debugger)
         total = 0
+        loaded_any = False
         for path in args:
             for nf in REGISTRY.load_path(path):
+                loaded_any = True
                 total += len(nf.types)
                 result.AppendMessage("loaded %s (%d types%s)" % (
                     nf.path, len(nf.types),
                     ", %d warnings" % len(nf.errors) if nf.errors else ""))
+        if not loaded_any:
+            result.AppendMessage("no .natvis files found under %s"
+                                 % ", ".join(args))
         result.AppendMessage("%d natvis type(s) active" % total)
 
     def _cmd_reload(self, debugger, args, exe_ctx, result):
@@ -138,7 +143,8 @@ class NatvisCommand:
 
 
 def autoscan(debugger):
-    """Load *.natvis from cwd, NATVIS_PATH entries, and target exe dirs."""
+    """Recursively load *.natvis under cwd, NATVIS_PATH entries, and target
+    exe directories (pruned + bounded, see registry.find_natvis_files)."""
     REGISTRY.attach(debugger)
     candidates = [os.getcwd()]
     env_path = os.environ.get("NATVIS_PATH")
@@ -149,18 +155,17 @@ def autoscan(debugger):
         exe = target.GetExecutable()
         if exe and exe.GetDirectory():
             candidates.append(exe.GetDirectory())
+    skip_roots = ("/", os.path.expanduser("~"))   # Xcode launches with cwd=/
     seen = set()
     found = 0
     for cand in candidates:
         cand = os.path.abspath(cand)
-        if cand in seen or not os.path.isdir(cand):
+        if cand in seen or cand in skip_roots or not os.path.isdir(cand):
             continue
         seen.add(cand)
         try:
-            entries = sorted(os.listdir(cand))
-        except OSError:
-            continue
-        if any(e.lower().endswith(".natvis") for e in entries):
             for nf in REGISTRY.load_path(cand):
                 found += len(nf.types)
+        except (OSError, IOError):
+            continue
     return found

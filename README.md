@@ -23,10 +23,12 @@ command script import /path/to/lldb-natvis/lldb_natvis.py
 > Options) replaces `~/.lldbinit` entirely, so include the import line there
 > too.
 
-On import, every `*.natvis` in the current working directory, in `$NATVIS_PATH`
-(colon-separated directories), and next to any existing target executable is
-loaded automatically. Xcode usually launches with `/` as cwd, so for Xcode
-either set `NATVIS_PATH` or add an explicit line:
+On import, every `*.natvis` **under** the current working directory (recursive,
+skipping `.git`/build dirs, bounded to 5000 dirs / depth 8), under
+`$NATVIS_PATH` entries (colon-separated), and under any existing target
+executable's directory is loaded automatically. Xcode usually launches with `/`
+as cwd (which is never scanned), so for Xcode either set `NATVIS_PATH` or add
+an explicit line:
 
 ```
 command script import /path/to/lldb-natvis/lldb_natvis.py

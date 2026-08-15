@@ -21,6 +21,38 @@ _SUMMARY_FUNC = "lldb_natvis.natvis_summary"
 _SYNTH_CLASS = "lldb_natvis.NatvisSyntheticProvider"
 _OVERRIDE_CAP = 4096
 
+# directory-scan guards: recursive, but bounded and pruned so a giant tree
+# (or Xcode's cwd of "/") can never stall the debugger at startup
+_PRUNE_DIRS = frozenset([
+    ".git", ".svn", ".hg", "node_modules", "DerivedData", "__pycache__",
+    ".build", ".swiftpm", "build", "Build", "Intermediate", "Binaries",
+])
+_SCAN_MAX_DIRS = 5000
+_SCAN_MAX_DEPTH = 8
+
+
+def find_natvis_files(root, max_dirs=_SCAN_MAX_DIRS, max_depth=_SCAN_MAX_DEPTH):
+    """Yield every *.natvis under root, recursively (pruned + bounded)."""
+    root = os.path.abspath(root)
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        visited += 1
+        if visited > max_dirs:
+            log.warning("natvis scan of %s stopped at %d directories",
+                        root, max_dirs)
+            return
+        depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not d.startswith(".")
+                                 and d not in _PRUNE_DIRS)
+        for name in sorted(filenames):
+            if name.lower().endswith(".natvis"):
+                yield os.path.join(dirpath, name)
+
 
 class Resolved:
     """A dispatch result: the matched natvis Type, bound $T args, and the value
@@ -74,14 +106,13 @@ class NatvisRegistry:
         self.debugger = debugger
 
     def load_path(self, path):
-        """Load a .natvis file or every *.natvis in a directory.
-        Returns list of NatvisFile."""
+        """Load a .natvis file, or every *.natvis under a directory tree
+        (recursive, pruned).  Returns list of NatvisFile."""
         loaded = []
         path = os.path.abspath(os.path.expanduser(path))
         if os.path.isdir(path):
-            for entry in sorted(os.listdir(path)):
-                if entry.lower().endswith(".natvis"):
-                    loaded.append(self._load_file(os.path.join(path, entry)))
+            for found in find_natvis_files(path):
+                loaded.append(self._load_file(found))
         elif os.path.isfile(path):
             loaded.append(self._load_file(path))
         else:
