@@ -8,7 +8,8 @@ import lldb
 
 from . import log
 from .display import interpolate
-from .expr import EvalError, evaluate, evaluate_bool, evaluate_int, int_eval
+from .expr import (EvalError, evaluate, evaluate_any, evaluate_bool,
+                   evaluate_int, int_eval, make_value)
 from .model import SBreak, SExec, SIf, SItem, SLoop, SSize
 
 _LOOP_CAP = 100000
@@ -142,7 +143,8 @@ class Interp:
 
     def _emit(self, stmt):
         try:
-            sbv = evaluate(self.val, self._prep(stmt.expr), self.env)
+            value, is_sbvalue = evaluate_any(
+                self.val, self._prep(stmt.expr), self.env)
         except EvalError as exc:
             log.debug("CustomListItems <Item> %r: %s", stmt.expr, exc)
             return
@@ -151,7 +153,13 @@ class Interp:
                                self.resolved.intrinsics(), self.env)
         else:
             name = "[%d]" % len(self.items)
-        self.items.append((name, sbv))
+        if not is_sbvalue:
+            try:
+                value = make_value(self.val, name, value)
+            except EvalError as exc:
+                log.debug("CustomListItems <Item> %r: %s", stmt.expr, exc)
+                return
+        self.items.append((name, value))
         if len(self.items) >= self.max_items:
             raise _Done()
 

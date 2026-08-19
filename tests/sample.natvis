@@ -198,6 +198,25 @@
     <DisplayString>rec-safe:{v}</DisplayString>
   </Type>
 
+  <!-- Tier-1 expression engine: none of these may reach the compiler -->
+  <Type Name="ExprTest">
+    <DisplayString>{a}/{b}={a / b} rem={a % b} negdiv={neg / b} f={a * f}</DisplayString>
+    <Expand>
+      <Item Name="[ternary]">a &gt; b ? a * 100 : b * 100</Item>
+      <Item Name="[shifts]">(flags &gt;&gt; 8) | (b &lt;&lt; 4)</Item>
+      <Item Name="[logic]">a &gt; 0 &amp;&amp; b &gt; 0 ? 1 : 0</Item>
+      <Item Name="[precedence]">a + b * 3 - 1</Item>
+      <Item Name="[deref-index]">arr[b + 1]</Item>
+      <Item Name="[ptr-math]" Condition="ptr != 0">*(ptr + 2)</Item>
+      <Item Name="[negate]">-a</Item>
+      <Item Name="[not]">!a</Item>
+      <ArrayItems>
+        <Size>a - b - 2</Size>
+        <ValuePointer>ptr + 1</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
   <!-- views -->
   <Type Name="Viewy">
     <DisplayString ExcludeView="simple">full:{a} {b}</DisplayString>

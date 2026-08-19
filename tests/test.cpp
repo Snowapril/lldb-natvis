@@ -150,6 +150,17 @@ struct RecIntr {
     int v;
 };
 
+// --- Tier-1 expression engine: arithmetic, ternary, shifts, ptr math --------
+struct ExprTest {
+    int   a;        // 7
+    int   b;        // 2
+    int   neg;      // -7
+    int   flags;    // 0x140
+    int   arr[6];   // 10,20,30,40,50,60
+    int*  ptr;      // &arr[0]
+    float f;        // 2.5
+};
+
 // --- IncludeView / ExcludeView + ,view(x) -----------------------------------
 struct Viewy {
     int a;
@@ -228,6 +239,15 @@ int main() {
     int backing[4] = {1, 2, 3, 4};
     BadSize badsize{-3, backing};
     RecIntr recintr{9};
+
+    ExprTest et{};
+    et.a = 7;
+    et.b = 2;
+    et.neg = -7;
+    et.flags = 0x140;
+    for (int i = 0; i < 6; ++i) et.arr[i] = (i + 1) * 10;
+    et.ptr = et.arr;
+    et.f = 2.5f;
 
     volatile int stop = 0;  // BREAK HERE
     (void)stop;

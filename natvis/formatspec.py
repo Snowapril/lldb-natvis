@@ -216,6 +216,55 @@ def render_value(sbv, spec, render_child_summary, current_view=""):
     return _default_render(sbv, render_child_summary, current_view)
 
 
+def fmt_number(value):
+    """Render a Python number the way LLDB renders the equivalent value
+    (floats that are whole print without a trailing '.0')."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return repr(value)
+        if value.is_integer() and abs(value) < 1e16:
+            return str(int(value))
+        return repr(value)
+    return str(value)
+
+
+def render_number(value, spec):
+    """Render a computed (Tier-1) numeric result under a format specifier.
+    Specifiers that need a live object (,s ,en ,na ...) just print decimal."""
+    if spec is None:
+        return fmt_number(value)
+    kind = spec.kind
+    ival = int(value)
+    if kind in ("d",):
+        out = str(ival)
+    elif kind in ("x", "h", "xb", "hr"):
+        out = "0x%x" % (ival & 0xFFFFFFFFFFFFFFFF if ival < 0 else ival)
+    elif kind in ("X", "H", "Xb", "Hb"):
+        out = "0x%X" % (ival & 0xFFFFFFFFFFFFFFFF if ival < 0 else ival)
+    elif kind == "o":
+        out = "0%o" % ival
+    elif kind in ("b", "bb"):
+        out = "0b{:b}".format(ival)
+    elif kind == "c":
+        out = chr(ival & 0xFF) if 0 <= (ival & 0xFF) < 0x110000 else str(ival)
+    elif kind == "e":
+        out = "%e" % value
+    elif kind == "f":
+        out = "%f" % value
+    elif kind == "g":
+        out = "%g" % value
+    else:
+        return fmt_number(value)
+    if spec.width and kind in ("d", "x", "h", "X", "H", "o", "b"):
+        prefix, body = ("", out)
+        if out[:2] in ("0x", "0b"):
+            prefix, body = out[:2], out[2:]
+        out = prefix + body.rjust(spec.width, "0")
+    return out
+
+
 def _default_render(sbv, render_child_summary, current_view=""):
     if render_child_summary is not None:
         summary = render_child_summary(sbv, current_view)

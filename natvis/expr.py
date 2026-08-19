@@ -6,6 +6,7 @@ SBValue.EvaluateExpression, which evaluates C++ with the object's members in
 scope -- exactly the natvis semantic."""
 
 import ast
+import math
 import re
 from functools import lru_cache
 
@@ -195,40 +196,146 @@ def int_eval(expr, env=None):
     return result
 
 
-# ----------------------------------------------------------- Tier 1: chains
+# -------------------------------------------------- Tier 1: expression engine
+#
+# Tier 2 (SBValue.EvaluateExpression) costs ~5 SECONDS for the first call in a
+# large program -- LLDB has to spin up its expression parser over every module.
+# So the fast path is not an optimization here, it is the difference between a
+# usable debugger and an unusable one: it must cover essentially every natvis
+# expression, not just member chains.  Anything it declines falls back to the
+# compiler and the user pays that stall once per process.
 
 _TOKEN_RE = re.compile(r"""
     \s*(
-        ->|\.|\[|\]|\(|\)|\*|&|
-        0[xX][0-9a-fA-F]+|\d+|
-        [A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*
+        ->|<<|>>|<=|>=|==|!=|&&|\|\| |
+        0[xX][0-9a-fA-F]+[uUlL]*|
+        (?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFuUlL]*|
+        '(?:\\.|[^'])'|
+        (?:::)?[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*|
+        [-+*/%&|^~!<>?:.\[\]()]
     )""", re.VERBOSE)
 
+_UNSIGNED_BASIC = frozenset([
+    lldb.eBasicTypeUnsignedChar, lldb.eBasicTypeUnsignedShort,
+    lldb.eBasicTypeUnsignedInt, lldb.eBasicTypeUnsignedLong,
+    lldb.eBasicTypeUnsignedLongLong, lldb.eBasicTypeBool,
+    lldb.eBasicTypeChar16, lldb.eBasicTypeChar32,
+])
+_FLOAT_BASIC = frozenset([
+    lldb.eBasicTypeFloat, lldb.eBasicTypeDouble, lldb.eBasicTypeLongDouble,
+])
 
-def _tokenize_chain(expr):
+_ESCAPES = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92, "'": 39, '"': 34}
+
+
+def _tokenize(expr):
     tokens = []
     pos = 0
-    while pos < len(expr):
+    n = len(expr)
+    while pos < n:
+        if expr[pos].isspace():
+            pos += 1
+            continue
         m = _TOKEN_RE.match(expr, pos)
         if not m:
-            if expr[pos:].strip() == "":
-                break
             return None
         tokens.append(m.group(1))
         pos = m.end()
     return tokens
 
 
+def _parse_literal(tok):
+    """Token -> Python number, or None if it isn't a literal."""
+    if tok[0] == "'":
+        body = tok[1:-1]
+        if body.startswith("\\"):
+            return _ESCAPES.get(body[1:2], 0)
+        return ord(body) if body else 0
+    if not (tok[0].isdigit() or tok[0] == "."):
+        return None
+    if tok[:2] in ("0x", "0X"):
+        # strip only integer suffixes: 'f'/'F' are hex digits (0xff, 0xbeef)
+        try:
+            return int(tok.rstrip("uUlL"), 16)
+        except ValueError:
+            return None
+    body = tok.rstrip("uUlLfF")
+    try:
+        if "." in body or "e" in body or "E" in body:
+            return float(body)
+        return int(body, 8) if len(body) > 1 and body[0] == "0" else int(body)
+    except ValueError:
+        return None
+
+
+def _num(value):
+    """SBValue or Python scalar -> Python number (C value semantics)."""
+    if isinstance(value, (int, float)):
+        return value
+    if not _valid(value):
+        raise EvalError("invalid value in arithmetic")
+    t = value.GetType()
+    if t.IsPointerType() or t.IsArrayType():
+        return value.GetValueAsUnsigned(0)
+    basic = t.GetCanonicalType().GetBasicType()
+    if basic in _FLOAT_BASIC:
+        text = value.GetValue()
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            raise EvalError("cannot read float value")
+    if basic in _UNSIGNED_BASIC:
+        return value.GetValueAsUnsigned(0)
+    return value.GetValueAsSigned(0)
+
+
+def _cdiv(a, b):
+    if b == 0:
+        raise EvalError("division by zero")
+    if isinstance(a, float) or isinstance(b, float):
+        return a / b
+    q = abs(a) // abs(b)                      # C truncates toward zero,
+    return -q if (a < 0) != (b < 0) else q    # Python // floors
+
+
+def _cmod(a, b):
+    if b == 0:
+        raise EvalError("division by zero")
+    if isinstance(a, float) or isinstance(b, float):
+        return math.fmod(a, b)
+    return a - _cdiv(a, b) * b
+
+
 def _valid(sbv):
     return sbv is not None and sbv.IsValid() and sbv.GetError().Success()
 
 
+def raw_value(sbv):
+    """Strip reference-ness and any synthetic child filter.
+
+    Critical: once our own synthetic provider is registered for a type,
+    Dereference()/children return the *visualized* view, whose children are
+    natvis items ([size], [0], ...) rather than the real fields.  Expression
+    evaluation must always see the real fields, or every member lookup on a
+    visualized type silently falls through to the compiler."""
+    if not _valid(sbv):
+        return sbv
+    out = sbv.GetNonSyntheticValue()
+    t = out.GetType()
+    if t.IsValid() and t.IsReferenceType():
+        deref = out.Dereference()
+        if _valid(deref):
+            out = deref.GetNonSyntheticValue()
+    return out
+
+
 def _child_member(cur, name):
+    cur = raw_value(cur)
     child = cur.GetChildMemberWithName(name)
     if not _valid(child) and cur.TypeIsPointerType():
         deref = cur.Dereference()
         if _valid(deref):
-            child = deref.GetChildMemberWithName(name)
+            child = deref.GetNonSyntheticValue().GetChildMemberWithName(name)
     return child
 
 
@@ -254,127 +361,406 @@ def _index_child(cur, i):
     return None
 
 
-class _ChainParser:
-    """Recursive-descent parser/evaluator for the restricted grammar:
-       unary  := ('*'|'&')* chain
-       chain  := primary ( '.' IDENT | '->' IDENT | '[' index ']' )*
-       primary:= IDENT | 'this' | '(' unary ')'
+class _Decline(Exception):
+    """This expression needs the real compiler (Tier 2)."""
+
+
+class _Evaluator:
+    """Recursive-descent evaluator with C precedence and value semantics.
+
+    Operands are SBValues (member chains) or Python numbers (literals and
+    computed results); `_num` bridges the two.  Anything outside the grammar --
+    casts, calls, sizeof -- raises _Decline so the caller falls back to Tier 2.
     """
 
     def __init__(self, tokens, root, env):
         self.tokens = tokens
         self.pos = 0
         self.root = root
-        self.env = env
+        self.env = env or {}
 
-    def peek(self):
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+    # ------------------------------------------------------------- helpers
 
-    def next(self):
+    def peek(self, ahead=0):
+        i = self.pos + ahead
+        return self.tokens[i] if i < len(self.tokens) else None
+
+    def take(self):
         tok = self.peek()
         self.pos += 1
         return tok
 
-    def parse_unary(self):
+    def expect(self, tok):
+        if self.take() != tok:
+            raise _Decline("expected %r" % tok)
+
+    # --------------------------------------------- precedence climbing
+
+    def parse(self):
+        return self.ternary()
+
+    def ternary(self):
+        cond = self.binary(0)
+        if self.peek() != "?":
+            return cond
+        self.take()
+        then = self.ternary()
+        self.expect(":")
+        other = self.ternary()
+        return then if _truthy_operand(cond) else other
+
+    # binary operator table, lowest precedence first
+    _LEVELS = [
+        ("||",), ("&&",), ("|",), ("^",), ("&",), ("==", "!="),
+        ("<", ">", "<=", ">="), ("<<", ">>"), ("+", "-"), ("*", "/", "%"),
+    ]
+
+    def binary(self, level):
+        if level >= len(self._LEVELS):
+            return self.unary()
+        ops = self._LEVELS[level]
+        left = self.binary(level + 1)
+        while True:
+            tok = self.peek()
+            if tok not in ops:
+                return left
+            self.take()
+            # short-circuit, so `p != 0 && p->x` never derefs a null p
+            if tok == "&&":
+                if not _truthy_operand(left):
+                    self._skip_operand(level + 1)
+                    left = 0
+                    continue
+                left = 1 if _truthy_operand(self.binary(level + 1)) else 0
+                continue
+            if tok == "||":
+                if _truthy_operand(left):
+                    self._skip_operand(level + 1)
+                    left = 1
+                    continue
+                left = 1 if _truthy_operand(self.binary(level + 1)) else 0
+                continue
+            right = self.binary(level + 1)
+            left = self._apply(tok, left, right)
+
+    def _skip_operand(self, level):
+        """Consume (without evaluating) the operand of a short-circuited op."""
+        depth = 0
+        while True:
+            tok = self.peek()
+            if tok is None:
+                return
+            if tok in "([":
+                depth += 1
+            elif tok in ")]":
+                if depth == 0:
+                    return
+                depth -= 1
+            elif depth == 0 and tok in (":", "?"):
+                return
+            elif depth == 0:
+                for lvl in range(0, level):
+                    if tok in self._LEVELS[lvl]:
+                        return
+            self.take()
+
+    def _apply(self, op, left, right):
+        if op == "+" or op == "-":
+            ptr = _pointer_arith(left, right, op)
+            if ptr is not None:
+                return ptr
+        a, b = _num(left), _num(right)
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op == "/":
+            return _cdiv(a, b)
+        if op == "%":
+            return _cmod(a, b)
+        if op == "==":
+            return 1 if a == b else 0
+        if op == "!=":
+            return 1 if a != b else 0
+        if op == "<":
+            return 1 if a < b else 0
+        if op == ">":
+            return 1 if a > b else 0
+        if op == "<=":
+            return 1 if a <= b else 0
+        if op == ">=":
+            return 1 if a >= b else 0
+        ia, ib = int(a), int(b)
+        if op == "&":
+            return ia & ib
+        if op == "|":
+            return ia | ib
+        if op == "^":
+            return ia ^ ib
+        if op == "<<":
+            return ia << ib
+        if op == ">>":
+            return ia >> ib
+        raise _Decline("unknown operator %r" % op)
+
+    def unary(self):
         tok = self.peek()
         if tok == "*":
-            self.next()
-            inner = self.parse_unary()
-            if inner is None:
-                return None
-            out = inner.Dereference()
-            return out if _valid(out) else None
+            self.take()
+            inner = self.unary()
+            if isinstance(inner, (int, float)):
+                raise _Decline("cannot dereference a number")
+            out = raw_value(inner.Dereference())
+            if not _valid(out):
+                raise EvalError("cannot dereference")
+            return out
         if tok == "&":
-            self.next()
-            inner = self.parse_unary()
-            if inner is None:
-                return None
+            self.take()
+            inner = self.unary()
+            if isinstance(inner, (int, float)):
+                raise _Decline("cannot take address of a number")
             out = inner.AddressOf()
-            return out if _valid(out) else None
-        return self.parse_chain()
+            if not _valid(out):
+                raise EvalError("cannot take address")
+            return out
+        if tok == "!":
+            self.take()
+            return 0 if _truthy_operand(self.unary()) else 1
+        if tok == "-":
+            self.take()
+            return -_num(self.unary())
+        if tok == "+":
+            self.take()
+            return _num(self.unary())
+        if tok == "~":
+            self.take()
+            return ~int(_num(self.unary()))
+        return self.postfix()
 
-    def parse_chain(self):
-        cur = self.parse_primary()
-        if cur is None:
-            return None
+    def postfix(self):
+        cur = self.primary()
         while True:
             tok = self.peek()
             if tok in (".", "->"):
-                self.next()
-                name = self.next()
-                if name is None or not re.match(r"^[A-Za-z_]", name):
-                    return None
-                cur = _child_member(cur, name)
-                if not _valid(cur):
-                    return None
+                self.take()
+                name = self.take()
+                if name is None or not name[:1].isalpha() and name[:1] != "_":
+                    raise _Decline("bad member access")
+                if isinstance(cur, (int, float)):
+                    raise _Decline("member access on a number")
+                nxt = _child_member(cur, name)
+                if not _valid(nxt):
+                    raise EvalError("no member %r on %s"
+                                    % (name, cur.GetTypeName()))
+                cur = nxt
             elif tok == "[":
-                self.next()
-                idx = self.parse_index()
-                if idx is None or self.next() != "]":
-                    return None
-                cur = _index_child(cur, idx)
-                if cur is None or not _valid(cur):
-                    return None
+                self.take()
+                idx = int(_num(self.ternary()))
+                self.expect("]")
+                if isinstance(cur, (int, float)):
+                    raise _Decline("indexing a number")
+                nxt = _index_child(cur, idx)
+                if nxt is None or not _valid(nxt):
+                    raise EvalError("cannot index %s" % cur.GetTypeName())
+                cur = nxt
+            elif tok == "(":
+                raise _Decline("function call")
             else:
-                break
-        return cur
+                return cur
 
-    def parse_primary(self):
-        tok = self.next()
+    _TYPE_NOISE = frozenset(["const", "volatile", "struct", "class", "union",
+                             "enum", "unsigned", "signed"])
+
+    def primary(self):
+        tok = self.take()
         if tok is None:
-            return None
+            raise _Decline("unexpected end of expression")
         if tok == "(":
-            inner = self.parse_unary()
-            if inner is None or self.next() != ")":
-                return None
+            cast = self._try_cast()
+            if cast is not None:
+                return cast
+            inner = self.ternary()
+            self.expect(")")
             return inner
+        lit = _parse_literal(tok)
+        if lit is not None:
+            return lit
+        if not (tok[:1].isalpha() or tok[:1] == "_" or tok[:2] == "::"):
+            raise _Decline("unexpected token %r" % tok)
+        if tok == "true":
+            return 1
+        if tok in ("false", "nullptr", "NULL"):
+            return 0
         if tok == "this":
             return self.root
-        if re.match(r"^[A-Za-z_]", tok):
-            if self.env and tok in self.env:
-                val = self.env[tok]
-                if isinstance(val, int):
-                    return None       # int env var as value head -> slow path
-                return val
-            child = self.root.GetChildMemberWithName(tok)
-            if _valid(child):
-                return child
-            return None
-        return None
-
-    def parse_index(self):
-        tok = self.peek()
-        if tok is None:
-            return None
-        if re.match(r"^\d|^0[xX]", tok):
-            self.next()
-            try:
-                return int(tok, 0)
-            except ValueError:
-                return None
-        if self.env and tok in self.env and isinstance(self.env[tok], int):
-            self.next()
+        if tok in self.env:
             return self.env[tok]
-        # sub-chain index (e.g. arr[mSize - 1] is NOT handled here -> slow)
-        saved = self.pos
-        sub = self.parse_chain()
-        if sub is not None and _valid(sub):
-            return sub.GetValueAsSigned(0)
-        self.pos = saved
+        root = raw_value(self.root)
+        if not _valid(root):
+            raise EvalError("no value context for %r" % tok)
+        child = root.GetChildMemberWithName(tok)
+        if _valid(child):
+            return child
+        raise EvalError("no member %r on %s"
+                        % (tok, self.root.GetTypeName()))
+
+
+    def _try_cast(self):
+        """Just consumed '('.  If this is a C-style cast to a known type,
+        apply it and return the value; otherwise rewind and return None.
+
+        `*(Base*)this` is the standard natvis idiom for exposing base-class
+        members, so handling it here keeps a very common pattern off Tier 2.
+        The type lookup itself is what disambiguates a cast from a
+        parenthesized expression -- `(a)*b` only casts if `a` names a type."""
+        start = self.pos
+        words = []
+        stars = 0
+        while True:
+            tok = self.peek()
+            if tok is None:
+                break
+            if tok == "*":
+                stars += 1
+                self.take()
+                continue
+            if tok == ")":
+                break
+            if stars or not (tok[:1].isalpha() or tok[:1] == "_"):
+                break
+            words.append(tok)
+            self.take()
+        if not words or self.peek() != ")":
+            self.pos = start
+            return None
+        name = " ".join(w for w in words if w not in self._TYPE_NOISE)
+        if name.startswith("::"):
+            name = name[2:]          # global-scope qualifier, e.g. ::RID
+        if not name:
+            self.pos = start
+            return None
+        target = self.root.GetTarget()
+        sbtype = target.FindFirstType(name)
+        if not sbtype.IsValid():
+            self.pos = start
+            return None
+        self.take()                       # the ')'
+        for _ in range(stars):
+            sbtype = sbtype.GetPointerType()
+        operand = self.unary()
+        if isinstance(operand, (int, float)):
+            self.pos = start
+            raise _Decline("cast of a computed number")
+        if stars and not operand.GetType().IsPointerType():
+            operand = operand.AddressOf()   # natvis `this` is the object here
+            if not _valid(operand):
+                raise EvalError("cannot take address for cast")
+        out = operand.Cast(sbtype)
+        if not _valid(out):
+            raise EvalError("cast to %s failed" % sbtype.GetName())
+        return out
+
+
+def _truthy_operand(value):
+    if isinstance(value, (int, float)):
+        return value != 0
+    return truthy(value)
+
+
+def _pointer_arith(left, right, op):
+    """`ptr + n` / `ptr - n` keeping the pointer type, else None."""
+    if isinstance(left, (int, float)) or not _valid(left):
         return None
+    t = left.GetType()
+    if not t.IsPointerType():
+        return None
+    if not isinstance(right, (int, float)):
+        if not _valid(right) or right.GetType().IsPointerType():
+            return None      # ptr - ptr is a plain count; let _apply do it
+    elem = t.GetPointeeType()
+    step = elem.GetByteSize() if elem.IsValid() else 0
+    if not step:
+        return None
+    n = int(_num(right))
+    addr = left.GetValueAsUnsigned(0) + (n * step if op == "+" else -n * step)
+    target = left.GetTarget()
+    data = lldb.SBData.CreateDataFromUInt64Array(
+        target.GetByteOrder(), target.GetAddressByteSize(), [addr])
+    out = target.CreateValueFromData(left.GetName() or "ptr", data, t)
+    return out if _valid(out) else None
+
+
+_decline = {"why": ""}
+
+
+def make_value(root, name, number):
+    """Wrap a computed Python number in an SBValue, so a natvis <Item> whose
+    expression is arithmetic still yields a real child (and never needs the
+    compiler just to materialize a number)."""
+    target = root.GetTarget()
+    if isinstance(number, float):
+        data = lldb.SBData.CreateDataFromDoubleArray(
+            target.GetByteOrder(), target.GetAddressByteSize(), [number])
+        vtype = target.GetBasicType(lldb.eBasicTypeDouble)
+    else:
+        data = lldb.SBData.CreateDataFromSInt64Array(
+            target.GetByteOrder(), target.GetAddressByteSize(), [int(number)])
+        vtype = target.GetBasicType(lldb.eBasicTypeLongLong)
+    out = target.CreateValueFromData(name, data, vtype)
+    if not _valid(out):
+        raise EvalError("cannot materialize computed value %r" % number)
+    return out
+
+
+def _run_evaluator(root, expr, env):
+    """Returns (value, handled).  handled=False means the fast path could not
+    produce an answer -- either the grammar declined or resolution failed --
+    and the caller must fall back to the compiler, which understands things we
+    do not (casts, base-class names, statics, operators)."""
+    tokens = _tokenize(expr)
+    if not tokens:
+        _decline["why"] = "cannot tokenize"
+        return None, False
+    ev = _Evaluator(tokens, root, env)
+    try:
+        result = ev.parse()
+    except (_Decline, EvalError) as exc:
+        _decline["why"] = str(exc)
+        return None, False
+    if ev.pos != len(tokens):
+        _decline["why"] = "trailing tokens %r" % (tokens[ev.pos:],)
+        return None, False
+    if not isinstance(result, (int, float)) and not _valid(result):
+        _decline["why"] = "invalid result value"
+        return None, False
+    return result, True
 
 
 def fast_eval(root, expr, env=None):
     """Tier 1.  Returns an SBValue, or None when the expression is outside the
-    fast grammar / resolution failed (caller falls back to Tier 2)."""
-    tokens = _tokenize_chain(expr)
-    if not tokens:
-        return None
-    parser = _ChainParser(tokens, root, env)
-    result = parser.parse_unary()
-    if result is None or parser.pos != len(tokens):
+    fast grammar (caller falls back to Tier 2).  Numeric results are handled by
+    eval_scalar; this entry point exists for callers that need a real SBValue."""
+    result, ok = _run_evaluator(root, expr, env)
+    if not ok or isinstance(result, (int, float)):
         return None
     return result if _valid(result) else None
+
+
+def eval_scalar(root, expr, env=None):
+    """Tier 1 for numeric/boolean results.  Returns a Python number, or raises
+    EvalError (evaluation genuinely failed) / _Decline-as-None via NotScalar."""
+    result, ok = _run_evaluator(root, expr, env)
+    if not ok:
+        raise NotScalar(expr)
+    if isinstance(result, (int, float)):
+        return result
+    return _num(result)
+
+
+class NotScalar(EvalError):
+    """The fast evaluator declined; the caller should try Tier 2."""
 
 
 # ----------------------------------------------------------- Tier 2: JIT eval
@@ -416,6 +802,18 @@ def counters():
 
 
 def slow_eval(valobj, expr, env=None):
+    # Tier 2 is expensive -- the first call in a big program can take seconds
+    # while LLDB builds its expression parser. Log every one so `natvis verbose
+    # on` shows exactly which expressions are costing the user time.
+    if log.isEnabledFor(10):
+        import traceback
+        caller = "?"
+        for fr in reversed(traceback.extract_stack()[:-1]):
+            if "natvis/" in fr.filename and "expr.py" not in fr.filename:
+                caller = "%s:%s" % (fr.filename.rsplit("/", 1)[-1], fr.name)
+                break
+        log.debug("Tier 2 eval: %r on %s from %s (fast path: %s)", expr,
+                  valobj.GetTypeName(), caller, _decline["why"])
     expr = _env_substitute(expr, env)
     opts = lldb.SBExpressionOptions()
     opts.SetIgnoreBreakpoints(True)
@@ -429,6 +827,26 @@ def slow_eval(valobj, expr, env=None):
         raise EvalError("cannot evaluate %r: %s" % (expr, msg))
     _counters["slow"] += 1
     return result
+
+
+def evaluate_any(valobj, expr, env=None):
+    """Evaluate and return (value, is_sbvalue).  `value` is an SBValue when the
+    expression designates an object, or a Python number when it computes one.
+    Callers that must have an SBValue use evaluate() instead."""
+    expr = expr.strip()
+    if not expr:
+        raise EvalError("empty expression")
+    try:
+        result, ok = _run_evaluator(valobj, expr, env)
+    except EvalError:
+        result, ok = None, False
+    if ok:
+        _counters["fast"] += 1
+        if isinstance(result, (int, float)):
+            return result, False
+        if _valid(result):
+            return result, True
+    return slow_eval(valobj, expr, env), True
 
 
 def evaluate(valobj, expr, env=None):
@@ -463,34 +881,26 @@ def truthy(sbv):
     return sbv.GetValueAsUnsigned(0) != 0
 
 
-_ENV_NULLCHECK_RE = re.compile(
-    r"^\s*(!?)\s*([A-Za-z_][A-Za-z0-9_]*)\s*"
-    r"(?:(==|!=)\s*(0|nullptr|NULL)\s*)?$")
-
-
 def evaluate_bool(valobj, expr, env=None):
     try:
-        result = int_eval(expr, env)
-        _counters["int"] += 1
-        return bool(result)
+        result, ok = _run_evaluator(valobj, expr.strip(), env)
+        if ok:
+            _counters["int"] += 1
+            return _truthy_operand(result)
     except EvalError:
         pass
-    if env:
-        m = _ENV_NULLCHECK_RE.match(expr)
-        if m and m.group(2) in env and not isinstance(env[m.group(2)], int):
-            result = truthy(env[m.group(2)])
-            if m.group(1) == "!" or m.group(3) == "==":
-                result = not result
-            _counters["int"] += 1
-            return result
     return truthy(evaluate(valobj, expr, env))
 
 
 def evaluate_int(valobj, expr, env=None, signed=False):
     try:
-        result = int_eval(expr, env)
-        _counters["int"] += 1
-        return int(result)
+        result, ok = _run_evaluator(valobj, expr.strip(), env)
+        if ok:
+            _counters["int"] += 1
+            if isinstance(result, (int, float)):
+                return int(result)
+            return (result.GetValueAsSigned(0) if signed
+                    else result.GetValueAsUnsigned(0))
     except EvalError:
         pass
     sbv = evaluate(valobj, expr, env)

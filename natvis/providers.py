@@ -4,7 +4,8 @@ import lldb
 
 from . import interp, log
 from .display import interpolate
-from .expr import EvalError, evaluate, evaluate_bool, evaluate_int, subst_index
+from .expr import (EvalError, evaluate, evaluate_any, evaluate_bool,
+                   evaluate_int, make_value, subst_index)
 from .model import (
     ArrayItemsNode, CustomListItemsNode, ExpandedItemNode, IndexListItemsNode,
     ItemNode, LinkedListItemsNode, SyntheticNode, TreeItemsNode,
@@ -56,7 +57,7 @@ class NatvisSyntheticProvider:
             # build (empty) entries rather than falling back to raw children
             if resolved is not None and (resolved.expand() or
                                          resolved.synthetic is not None):
-                self.entries = _Builder(resolved, self.val).build()
+                self.entries = _Builder(resolved, resolved.val).build()
                 self.name_index = {e.name: i
                                    for i, e in enumerate(self.entries)}
         except Exception as exc:            # never break the debugger
@@ -185,13 +186,20 @@ class _Builder:
 
     def _build_item(self, node):
         expr = self._prep(node.expr)
+        name = node.name or expr
         try:
-            sbv = evaluate(self.val, expr)
+            sbv = self._value_of(expr, name)
         except EvalError:
             if node.optional:
                 return
             raise
-        self.entries.append(_Entry(node.name or expr, lambda sbv=sbv: sbv))
+        self.entries.append(_Entry(name, lambda sbv=sbv: sbv))
+
+    def _value_of(self, expr, name, env=None):
+        """Evaluate to an SBValue, materializing computed numbers locally
+        instead of paying for a Tier-2 compile just to get a scalar."""
+        value, is_sbvalue = evaluate_any(self.val, expr, env)
+        return value if is_sbvalue else make_value(self.val, name, value)
 
     def _size_of(self, sizes, env=None, dim=None):
         ce = self._pick(sizes, env)

@@ -282,7 +282,9 @@ class NatvisRegistry:
         if t.IsReferenceType():
             deref = val.Dereference()
             if deref.IsValid():
-                val = deref
+                # strip the synthetic view too, else expressions evaluated
+                # against this value would see natvis children, not fields
+                val = deref.GetNonSyntheticValue()
                 t = val.GetType()
         if t.IsPointerType():
             return None

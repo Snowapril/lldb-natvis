@@ -6,8 +6,9 @@ from functools import lru_cache
 import lldb
 
 from . import log
-from .expr import EvalError, evaluate, evaluate_bool, evaluate_int, preprocess
-from .formatspec import parse_spec, render_value
+from .expr import (EvalError, evaluate, evaluate_any, evaluate_bool,
+                   evaluate_int, preprocess)
+from .formatspec import parse_spec, render_number, render_value
 
 _MAX_DEPTH = 8
 _ERR_MARK = "??"
@@ -95,20 +96,44 @@ def _split_expr_spec(body):
     depth = 0
     quote = None
     last_comma = -1
+    skip = -1
     for i, ch in enumerate(body):
+        if i == skip:
+            continue
         if quote:
             if ch == quote and body[i - 1] != "\\":
                 quote = None
         elif ch in ("'", '"'):
             quote = ch
-        elif ch in "([<{":
+        elif ch in ("(", "[", "{"):
             depth += 1
-        elif ch in ")]>}":
-            if ch == ">" and i > 0 and body[i - 1] == "-":
-                continue
+        elif ch in (")", "]", "}"):
             depth -= 1
-        elif ch == "," and depth == 0:
+        elif ch == "<":
+            # '<<' and '<=' are operators, not template brackets
+            if body[i + 1:i + 2] in ("<", "="):
+                skip = i + 1
+            else:
+                depth += 1
+        elif ch == ">":
+            if body[i - 1:i] == "-" or body[i + 1:i + 2] in (">", "="):
+                if body[i + 1:i + 2] == ">":
+                    skip = i + 1
+            elif depth > 0:          # never let a comparison unbalance us
+                depth -= 1
+        elif ch == "," and depth <= 0:
             last_comma = i
+    if last_comma < 0 and depth > 0:
+        # an unmatched '<' was a comparison, not a template bracket: retry
+        # counting only unambiguous brackets
+        depth = 0
+        for i, ch in enumerate(body):
+            if ch in ("(", "[", "{"):
+                depth += 1
+            elif ch in (")", "]", "}"):
+                depth -= 1
+            elif ch == "," and depth <= 0:
+                last_comma = i
     if last_comma >= 0:
         spec = parse_spec(body[last_comma + 1:])
         if spec is not None:
@@ -135,8 +160,11 @@ def interpolate(text, valobj, bindings=(), intrinsics=None, env=None, view="",
                 out.append(_render_array(valobj, expr, spec, bindings,
                                          intrinsics, env, view))
                 continue
-            sbv = evaluate(valobj, expr, env)
-            out.append(render_value(sbv, spec, _child_summary, view) or "")
+            value, is_sbvalue = evaluate_any(valobj, expr, env)
+            if is_sbvalue:
+                out.append(render_value(value, spec, _child_summary, view) or "")
+            else:
+                out.append(render_number(value, spec))
         except EvalError as exc:
             if raise_errors:
                 raise

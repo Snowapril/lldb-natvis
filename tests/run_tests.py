@@ -14,7 +14,7 @@ BIN = os.path.join(HERE, "test_bin")
 VARIABLES = [
     "vec", "aliasRef", "fixed", "list", "map", "str", "wstr", "colors",
     "temp", "circle", "square", "self", "optZero", "optOther", "v3", "dq",
-    "table", "both", "alias", "views", "badsize", "recintr",
+    "table", "both", "alias", "views", "badsize", "recintr", "et",
 ]
 
 # (test name, regex expected to match the transcript; DOTALL applied)
@@ -78,6 +78,29 @@ EXPECTATIONS = [
      r"recintr = rec-safe:9"),
     ("unload restores raw children",
      r"mSize = 5"),
+    # Tier-1 expression engine (C semantics: int division truncates toward 0)
+    ("expr: arithmetic + C division",
+     r"et = 7/2=3 rem=1 negdiv=-3 f=17\.5"),
+    ("expr: ternary",
+     r"\[ternary\] = 700"),
+    ("expr: shifts and bit-or",
+     r"\[shifts\] = 33"),
+    ("expr: logical operators",
+     r"\[logic\] = 1"),
+    ("expr: operator precedence",
+     r"\[precedence\] = 12"),
+    ("expr: computed index",
+     r"\[deref-index\] = 40"),
+    ("expr: pointer arithmetic",
+     r"\[ptr-math\] = 30"),
+    ("expr: unary minus / not",
+     r"\[negate\] = -7.*?\[not\] = 0"),
+    ("expr: computed Size and ValuePointer offset",
+     r"\[not\] = 0.*?\[0\] = 20.*?\[1\] = 30.*?\[2\] = 40"),
+    # perf guard: the sample natvis must never need LLDB's expression compiler
+    # except for the one deliberately-missing member (see OptHolder)
+    ("perf: no unnecessary Tier-2 compiles",
+     r"eval paths\s+: fast=\d+ int=\d+ slow=0 slow_fail=1"),
 ]
 
 # (test name, regex, minimum occurrence count across the transcript)

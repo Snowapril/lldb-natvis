@@ -22,6 +22,12 @@ clean. See `IMPLEMENTATION.md` for how the pieces fit.
 
 ## Feature gaps
 
+- [ ] **Fast-path gaps that still reach the compiler** (each costs one ~5 s
+      stall per process, once): string literals in expressions,
+      `reinterpret_cast`/functional casts, and `sizeof`. 5 of 561 real-world
+      expressions. Use `natvis verbose on` to see which expressions in your own
+      natvis file fall through and why.
+
 - [ ] **Top-level `<Intrinsic>`.** Only intrinsics declared inside a `<Type>`
       are collected (`parser.py:_parse_type`); ones directly under
       `<AutoVisualizer>` are logged and skipped. Fix: collect them in

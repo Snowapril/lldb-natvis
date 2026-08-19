@@ -59,27 +59,56 @@ implementation used per-type regex specifiers and failed the inheritance test
 (`Square` deriving from a visualized `Shape`); switching to callbacks fixed it
 and simplified registration to a fixed two entries.
 
-### 2. Two-tier expression evaluation
+### 2. Two-tier expression evaluation — and why Tier 1 must cover everything
 
-`natvis/expr.py` evaluates each expression by the cheapest route that works:
+Measured on this machine (Apple lldb-1703):
 
-- **Tier 1** — a recursive-descent parser for the restricted grammar that
-  dominates real natvis files (`a.b->c[3]`, `*p`, `&x`, plus `chain OP intlit`
-  for conditions). It walks `SBValue` children directly via
-  `GetChildMemberWithName` / `Dereference` / `GetChildAtIndex`. No compiler.
-- **Tier 0'** — `int_eval`, a Python AST evaluator over an allow-list of nodes,
-  for pure integer/bool expressions. This is what keeps `<CustomListItems>`
-  loops (which run O(N) times) from JIT-compiling on every iteration.
-- **Tier 2** — `SBValue.EvaluateExpression`, which evaluates C++ with the
-  object's members in scope. That is exactly the natvis semantic, so this is
-  the correctness backstop for everything the fast paths decline.
+| First `EvaluateExpression` in the process | Cost |
+|---|---|
+| Small test binary (46 modules) | 84 ms |
+| Real project binary (517 modules, 22 MB) | **5,238 ms** |
 
-The sample suite runs ~80% of evaluations on the fast paths. `natvis status`
-reports the live split (`fast` / `int` / `slow` / `slow_fail`) — a useful first
-stop when a visualizer feels slow.
+Subsequent calls are ~1 ms — the cost is LLDB building its expression parser
+across every module, paid once. But it is paid on the *first* natvis expression
+that misses the fast path, which is the user's first variable print. Five
+seconds to expand one variable is the difference between a usable debugger and
+an unusable one.
 
-Everything starts from `GetNonSyntheticValue()` so evaluation never recurses
-into our own synthetic children.
+So the fast path is not an optimization, it is the product requirement. It is a
+full recursive-descent evaluator with C precedence and value semantics —
+arithmetic, comparisons, logical operators with short-circuit, bit ops, shifts,
+ternary, unary, member/index/deref chains, pointer arithmetic, and C-style
+casts to named types (`*(Base*)this`, the standard base-class idiom). Integer
+division truncates toward zero like C, not toward negative infinity like
+Python.
+
+Coverage against 561 unique expressions from 14 real natvis files (godot, llvm,
+tint, imgui, glm, nlohmann_json, vma, spirv-cross, D3D12MemAlloc):
+**556 accepted (99.1%)**. The remainder are string literals, `reinterpret_cast`
+and functional casts, which correctly fall through to the compiler.
+
+The full-featured `tests/sample.natvis` now needs **zero** Tier-2 calls; a
+regression test asserts `slow=0` in `natvis status` so this cannot silently
+regress. `natvis verbose on` logs every Tier-2 call with the reason the fast
+path declined, which is how you diagnose a slow visualizer.
+
+
+So `natvis/expr.py` evaluates by the cheapest route that works:
+
+- **Tier 1** — the evaluator described above. Operands are either SBValues
+  (member chains, resolved by walking children — no compiler) or Python
+  numbers (literals and computed results); `_num` bridges them. A result that
+  is a plain number never needs an SBValue at all, and `make_value` wraps it
+  when a caller genuinely needs a child object.
+- **Tier 2** — `SBValue.EvaluateExpression`, the correctness backstop for
+  everything Tier 1 declines (it understands casts to unknown types, statics,
+  operators, methods). *Any* fast-path failure falls through here, including
+  resolution failures, so behavior never depends on the fast path's coverage.
+- `natvis status` reports the live split (`fast` / `int` / `slow` /
+  `slow_fail`) — the first place to look when a visualizer feels slow.
+
+Everything starts from `raw_value()` so evaluation sees real fields and never
+recurses into our own synthetic children.
 
 ### 3. Nested formatting delegates to LLDB
 
@@ -115,6 +144,7 @@ corrupt and the code runs in a UI callback:
 | Intrinsic expansion | `expr.py` | 64 substitutions (recursive `<Intrinsic>` raises instead of growing the string forever) |
 | Summary recursion | `display.py` | depth 8 + visited set |
 | Directory scan | `registry.py` | depth 8, 5000 dirs, prunes `.git`/`node_modules`/`DerivedData`/build dirs |
+| Tier-2 fallbacks | `expr.py` | avoided entirely for 99% of expressions (see above) |
 | Negative `<Size>` | `providers.py` | read signed, clamped to ≥ 0 |
 
 Exceptions are caught at every LLDB boundary (`natvis_summary`,
@@ -167,6 +197,14 @@ fixed and now covered:
 7. **Unparseable `<Exec>` silently no-oped**, spinning its loop to the cap. Now
    aborts the program.
 8. **Exceptions could escape `get_child_at_index`** into LLDB. Now caught.
+
+A ninth turned up later while profiling: once a synthetic provider is
+registered for a type, `Dereference()` and child access return the *visualized*
+view, so member lookup saw natvis items (`[size]`, `[0]`) instead of real
+fields (`mSize`). Every member access on a visualized type silently fell
+through to the compiler — a correctness bug that presented as a performance
+bug. `expr.raw_value()` now strips both reference-ness and the synthetic view
+before any member lookup.
 
 Two of these (1 and 2) were hang-class bugs in a debugger UI callback — the
 kind that a green test suite says nothing about. The lesson worth keeping: for
